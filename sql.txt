@@ -1,0 +1,145 @@
+Использована база данных (LocalDb)\MSSQLLocalDB
+
+1.	Сформируйте отчет, который содержит все счета, относящиеся к продуктам типа ДЕПОЗИТ, принадлежащих клиентам, у которых нет открытых продуктов типа КРЕДИТ.
+
+SELECT ACC_NUM
+FROM ACCOUNTS
+LEFT JOIN PRODUCTS
+ON ACCOUNTS.PRODUCT_REF = PRODUCTS.ID
+WHERE   PRODUCTS.PRODUCT_TYPE_ID = 2 AND
+ACCOUNTS.CLIENT_REF NOT IN
+(SELECT PRODUCTS.CLIENT_REF  FROM PRODUCTS
+WHERE PRODUCTS. PRODUCT_TYPE_ID  = 1 and PRODUCTS.CLOSE_DATE is null )
+
+
+2.	Сформируйте выборку, который содержит средние движения по счетам в рамках одного произвольного дня, в разрезе типа продукта.
+
+SELECT AVG(RECORDS.SUM) AS N'Среднее движение по счетам за день',
+CASE WHEN DT=0 THEN N'дебет' ELSE N'кредит'END N'тип операции'
+FROM RECORDS
+WHERE OPER_DATE = CONVERT(DATE,'01.10.2015',104) 
+AND DT IN (0,1)
+GROUP BY DT
+
+
+3.	Сформируйте выборку, в который попадут клиенты, у которых были операции по счетам за прошедший месяц от текущей даты. Выведите клиента и сумму операций за день в разрезе даты.
+
+SELECT CLIENTS.NAME AS N'Клиент', OPER_DATE AS N'Дата операции', SUM(RECORDS.SUM) AS N'Сумма      операций за день'
+FROM CLIENTS, ACCOUNTS, RECORDS
+WHERE CLIENTS.id = ACCOUNTS.CLIENT_REF
+AND ACCOUNTS.ID = RECORDS.ACC_REF
+AND OPER_DATE  > DATEADD(month,-1,GETDATE())
+GROUP BY OPER_DATE , CLIENTS.NAME
+
+4.	В результате сбоя в базе данных разъехалась информация между остатками и операциями по счетам. Напишите нормализацию (процедуру выравнивающую данные), которая найдет такие счета и восстановит остатки по счету.
+
+CREATE PROCEDURE Accounys_Saldo_UPDATE AS
+BEGIN
+
+SELECT * INTO ##Temp1 FROM
+(SELECT SUM(sample.summ) AS summ, sample.ACC_REF, sample.SALDO
+FROM
+(SELECT SUM(RECORDS.SUM) AS summ , RECORDS.ACC_REF, ACCOUNTS.SALDO
+FROM RECORDS JOIN ACCOUNTS
+ON ACCOUNTS.ID= RECORDS.ACC_REF
+WHERE RECORDS.DT =0
+GROUP BY ACC_REF, SALDO
+UNION 
+SELECT SUM(RECORDS.SUM *(-1)) AS summ , RECORDS.ACC_REF, ACCOUNTS.SALDO 
+FROM RECORDS JOIN ACCOUNTS
+ON ACCOUNTS.ID= RECORDS.ACC_REF
+WHERE RECORDS.DT=1
+GROUP BY RECORDS.DT, RECORDS.ACC_REF, ACCOUNTS.SALDO
+) AS sample
+group by sample.ACC_REF, sample.SALDO) AS t1
+UPDATE ACCOUNTS 
+SET ACCOUNTS.SALDO=##Temp1.summ
+FROM ##Temp1
+WHERE ##Temp1.ACC_REF = ACCOUNTS.ID
+
+DROP TABLE ##Temp1
+END;
+
+
+5.	Сформируйте выборку, который содержит информацию о клиентах, которые полностью погасили кредит, но при этом не закрыли продукт и пользуются им дальше (по продукту есть операция новой выдачи кредита).
+
+SELECT CLIENTS.NAME AS N'Клиент', COUNT(RECORDS.DT) AS  N'Количество выданных кредитов' , ACCOUNTS.SALDO, 
+COALESCE( CONVERT(varchar, PRODUCTS.CLOSE_DATE,104), N'не закрыт') AS N'статус'
+FROM CLIENTS, ACCOUNTS, RECORDS, PRODUCTS
+WHERE CLIENTS.ID = ACCOUNTS.CLIENT_REF
+AND ACCOUNTS.NAME Like N'%редит%'
+AND ACCOUNTS.ID = RECORDS.ACC_REF
+AND CLIENTS.ID = PRODUCTS.CLIENT_REF
+AND RECORDS.DT = 1 
+AND PRODUCT_TYPE_ID = 1
+AND PRODUCTS.CLOSE_DATE is null
+GROUP BY CLIENTS.NAME, PRODUCTS.CLOSE_DATE, ACCOUNTS.SALDO
+HAVING COUNT(RECORDS.DT)>1
+
+
+6.	Закройте продукты (установите дату закрытия равную текущей) типа КРЕДИТ, у которых произошло полное погашение, но при этом не было повторной выдачи.
+
+UPDATE PRODUCTS
+SET PRODUCTS.CLOSE_DATE = CONVERT(DATE, GETDATE(),104)
+WHERE PRODUCTS.ID IN 
+(
+SELECT PRODUCTS.ID
+FROM CLIENTS, ACCOUNTS, RECORDS, PRODUCTS
+WHERE CLIENTS.ID = ACCOUNTS.CLIENT_REF
+AND ACCOUNTS.ID = RECORDS.ACC_REF
+AND CLIENTS.ID = PRODUCTS.CLIENT_REF
+AND RECORDS.DT=1
+AND ACCOUNTS.SALDO=0
+AND PRODUCTS.PRODUCT_TYPE_ID=1
+AND PRODUCTS.CLOSE_DATE IS NULL
+GROUP BY PRODUCTS.ID, PRODUCTS.CLOSE_DATE, PRODUCTS.PRODUCT_TYPE_ID, ACCOUNTS.SALDO
+HAVING  COUNT(RECORDS.DT)=1    
+)
+
+
+7.	Закройте возможность открытия (установите дату окончания действия) для типов продуктов, по счетам продуктов которых, не было движений более одного месяца.
+              рассмотрела  исключить тех у кого вообще не было движения по счету
+
+UPDATE ACCOUNTS 
+SET ACCOUNTS.CLOSE_DATE = CONVERT(DATE, GETDATE(),104)
+WHERE ACCOUNTS.ACC_NUM IN 
+(
+SELECT DISTINCT ACCOUNTS.ACC_NUM
+FROM ACCOUNTS JOIN CLIENTS 
+ON  ACCOUNTS.CLIENT_REF= CLIENTS.ID 
+LEFT JOIN RECORDS
+ON ACCOUNTS.ID = RECORDS.ACC_REF
+EXCEPT
+SELECT DISTINCT ACCOUNTS.ACC_NUM 
+FROM ACCOUNTS JOIN CLIENTS 
+ON  ACCOUNTS.CLIENT_REF= CLIENTS.ID 
+JOIN RECORDS
+ON ACCOUNTS.ID = RECORDS.ACC_REF
+AND  ACCOUNTS.OPEN_DATE< DATEADD(month,-1,GETDATE())
+AND RECORDS.OPER_DATE> DATEADD(month,-1,GETDATE())
+GROUP BY RECORDS. OPER_DATE, ACCOUNTS.ACC_NUM, ACCOUNTS.NAME
+)
+
+8.	В модель данных добавьте сумму договора по продукту. Заполните поле для всех продуктов суммой максимальной дебетовой операции по счету для продукта типа КРЕДИТ, и суммой максимальной кредитовой операции по счету продукта для продукта типа ДЕПОЗИТ или КАРТА.
+ALTER TABLE PRODUCTS
+ADD MAX_SUM decimal(10,2) NULL;
+
+SELECT * INTO #Temp FROM
+(SELECT DISTINCT MAX(sum) AS MAX_SUM, PRODUCTS.PRODUCT_TYPE_ID, ACCOUNTS.CLIENT_REF
+FROM PRODUCTS JOIN ACCOUNTS
+ON PRODUCTS.ID= ACCOUNTS.PRODUCT_REF
+JOIN RECORDS
+ON ACCOUNTS.ID= RECORDS.ACC_REF
+WHERE RECORDS.DT=1 AND PRODUCTS.PRODUCT_TYPE_ID=1
+OR RECORDS.DT =0 AND PRODUCTS.PRODUCT_TYPE_ID IN (2,3)
+GROUP BY PRODUCTS.PRODUCT_TYPE_ID, ACCOUNTS.CLIENT_REF) AS t
+
+UPDATE PRODUCTS 
+SET PRODUCTS.MAX_SUM=#Temp.MAX_SUM
+FROM #Temp
+WHERE #Temp.CLIENT_REF =PRODUCTS.CLIENT_REF
+AND PRODUCTS.PRODUCT_TYPE_ID=#Temp.PRODUCT_TYPE_ID
+
+DROP TABLE #Temp 
+
+
